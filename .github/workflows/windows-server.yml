@@ -13,148 +13,145 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ============================================
-      # 1. INSTALL NETBIRD (LATEST VERSION)
-      # ============================================
+      # ============================================================
+      # [IMAGE] NetBird Installation Banner
+      # https://raw.githubusercontent.com/netbirdio/netbird/master/docs/images/netbird-logo.png
+      # ============================================================
       - name: Install NetBird
         shell: pwsh
         run: |
-          Write-Host "📥 Fetching latest NetBird release..."
+          Write-Host "Downloading latest NetBird release..."
 
-          # Get latest release JSON
           $release = Invoke-WebRequest -Uri "https://api.github.com/repos/netbirdio/netbird/releases/latest" -UseBasicParsing | ConvertFrom-Json
-
-          # Find Windows MSI asset
           $asset = $release.assets | Where-Object { $_.name -like "*windows_amd64.msi" } | Select-Object -First 1
 
           $NetBirdUrl = $asset.browser_download_url
-          Write-Host "🔗 Latest NetBird URL: $NetBirdUrl"
+          Write-Host "Latest NetBird URL: $NetBirdUrl"
 
           Invoke-WebRequest -Uri $NetBirdUrl -OutFile "$env:TEMP\netbird.msi" -UseBasicParsing
 
-          Write-Host "📦 Installing NetBird..."
+          Write-Host "Installing NetBird..."
           Start-Process msiexec -Wait -ArgumentList "/i `"$env:TEMP\netbird.msi`" /quiet /norestart"
 
-          Write-Host "✅ NetBird installed"
+          Write-Host "NetBird installation completed"
 
-      # ============================================
-      # 2. CONNECT NETBIRD
-      # ============================================
+      # ============================================================
+      # [IMAGE] NetBird Connection Banner
+      # https://raw.githubusercontent.com/netbirdio/netbird/master/docs/images/dashboard.png
+      # ============================================================
       - name: Connect NetBird
         env:
           NETBIRD_SETUP_KEY: ${{ secrets.NETBIRD_SETUP_KEY }}
         shell: pwsh
         run: |
           $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-          
-          Write-Host "🔗 Connecting NetBird..."
+
+          Write-Host "Connecting NetBird..."
           netbird up --setup-key $env:NETBIRD_SETUP_KEY
-          
+
           Start-Sleep -Seconds 10
-          
-          Write-Host "📊 NetBird status:"
+
+          Write-Host "NetBird status:"
           netbird status
 
-      # ============================================
-      # 3. ENABLE RDP
-      # ============================================
+      # ============================================================
+      # [IMAGE] RDP Banner
+      # https://upload.wikimedia.org/wikipedia/commons/5/5f/Remote_Desktop_Connection_icon.png
+      # ============================================================
       - name: Enable RDP
         shell: pwsh
         run: |
-          Write-Host "🖥️ Enabling RDP..."
+          Write-Host "Enabling RDP..."
           Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Write-Host "✅ RDP enabled"
+          Write-Host "RDP enabled"
 
-      # ============================================
-      # 4. FIND ADMIN ACCOUNT & SET PASSWORD
-      # ============================================
+      # ============================================================
+      # [IMAGE] Administrator Account Banner
+      # https://upload.wikimedia.org/wikipedia/commons/9/99/Windows_User_Account.png
+      # ============================================================
       - name: Setup Admin Account
         shell: pwsh
         run: |
-          Write-Host "🔍 Finding admin account..."
-          
+          Write-Host "Detecting Administrator account..."
+
           $adminUser = Get-LocalUser | Where-Object { $_.SID -like "S-1-5-21-*-500" } | Select-Object -First 1
-          
+
           if ($adminUser) {
             $adminName = $adminUser.Name
           } else {
             $adminName = "Administrator"
           }
-          
-          Write-Host "✅ Admin user: $adminName"
-          
+
+          Write-Host "Admin user: $adminName"
+
           $Password = ConvertTo-SecureString "Root@2024!" -AsPlainText -Force
           Set-LocalUser -Name $adminName -Password $Password
           Enable-LocalUser -Name $adminName
-          
-          Write-Host "✅ Password set for: $adminName"
+
+          Write-Host "Password updated for: $adminName"
           echo "ADMIN_USER=$adminName" >> $env:GITHUB_ENV
 
-      # ============================================
-      # 5. INSTALL 7-ZIP (OFFICIAL)
-      # ============================================
+      # ============================================================
+      # [IMAGE] 7-Zip Banner
+      # https://www.7-zip.org/img/logo.png
+      # ============================================================
       - name: Install 7-Zip
         shell: pwsh
         run: |
-          Write-Host "📦 Installing 7-Zip (official)..."
+          Write-Host "Installing 7-Zip..."
           $url = "https://www.7-zip.org/a/7z2409-x64.exe"
           Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\7zip.exe" -UseBasicParsing
           Start-Process -FilePath "$env:TEMP\7zip.exe" -ArgumentList "/S" -Wait
-          Write-Host "✅ 7-Zip installed"
+          Write-Host "7-Zip installed"
 
-      # ============================================
-      # 6. GET NETBIRD IP
-      # ============================================
+      # ============================================================
+      # [IMAGE] NetBird IP Banner
+      # https://raw.githubusercontent.com/netbirdio/netbird/master/docs/images/network-map.png
+      # ============================================================
       - name: Get NetBird IP
         shell: pwsh
         run: |
           $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-          
+
           $status = netbird status
           Write-Host "NetBird status:"
           Write-Host $status
-          
+
           $NetBirdIP = $status | Select-String "NetBird IP" | ForEach-Object { $_ -replace '.*NetBird IP:\s*', '' }
           $NetBirdIP = $NetBirdIP -replace '/.*', ''
-          
-          Write-Host "📡 NetBird IP: $NetBirdIP"
+
+          Write-Host "NetBird IP: $NetBirdIP"
           echo "NETBIRD_IP=$NetBirdIP" >> $env:GITHUB_ENV
 
-      # ============================================
-      # 7. CONNECTION INFO
-      # ============================================
+      # ============================================================
+      # [IMAGE] Connection Info Banner
+      # https://upload.wikimedia.org/wikipedia/commons/3/3a/Microsoft_Windows_logo.png
+      # ============================================================
       - name: Connection Info
         run: |
           echo "=========================================="
-          echo "✅ WINDOWS SERVER READY"
+          echo "WINDOWS SERVER READY"
           echo "=========================================="
           echo ""
-          echo "📡 NetBird IP: ${{ env.NETBIRD_IP }}"
+          echo "NetBird IP: ${{ env.NETBIRD_IP }}"
           echo ""
-          echo "🖥️ RDP (port 3389):"
+          echo "RDP (port 3389):"
           echo "  Address: ${{ env.NETBIRD_IP }}:3389"
           echo "  User: ${{ env.ADMIN_USER }}"
           echo "  Password: Root@2024!"
           echo ""
-          echo "📦 Installed: 7-Zip"
+          echo "Installed: 7-Zip"
           echo ""
-          echo "👑 User: ${{ env.ADMIN_USER }} / Password: Root@2024!"
-          echo "♾️ Server runs UNLIMITED TIME"
+          echo "User: ${{ env.ADMIN_USER }} / Password: Root@2024!"
+          echo "Server runtime: Unlimited"
           echo "=========================================="
 
-      # ============================================
-      # 8. KEEP ALIVE (UNLIMITED)
-      # ============================================
+      # ============================================================
+      # [IMAGE] Keep Alive Banner
+      # https://upload.wikimedia.org/wikipedia/commons/6/6f/Server-icon.svg
+      # ============================================================
       - name: Keep Alive (Unlimited)
         run: |
-          echo "=========================================="
-          echo "🚀 WINDOWS SERVER RUNNING"
-          echo "=========================================="
-          echo ""
-          echo "✅ NetBird: CONNECTED"
-          echo "✅ RDP: ACTIVE on 3389"
-          echo "✅ 7-Zip: INSTALLED"
-          echo ""
-          echo "♾️ Keeping alive forever..."
+          echo "Server is running indefinitely..."
           while ($true) { Start-Sleep -Seconds 60 }
