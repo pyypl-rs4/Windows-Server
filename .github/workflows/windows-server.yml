@@ -20,21 +20,11 @@ jobs:
         shell: pwsh
         run: |
           Write-Host "📥 Fetching latest NetBird release..."
-
-          # Get latest release JSON
           $release = Invoke-WebRequest -Uri "https://api.github.com/repos/netbirdio/netbird/releases/latest" -UseBasicParsing | ConvertFrom-Json
-
-          # Find Windows MSI asset
           $asset = $release.assets | Where-Object { $_.name -like "*windows_amd64.msi" } | Select-Object -First 1
-
           $NetBirdUrl = $asset.browser_download_url
-          Write-Host "🔗 Latest NetBird URL: $NetBirdUrl"
-
           Invoke-WebRequest -Uri $NetBirdUrl -OutFile "$env:TEMP\netbird.msi" -UseBasicParsing
-
-          Write-Host "📦 Installing NetBird..."
           Start-Process msiexec -Wait -ArgumentList "/i `"$env:TEMP\netbird.msi`" /quiet /norestart"
-
           Write-Host "✅ NetBird installed"
 
       # ============================================
@@ -46,13 +36,8 @@ jobs:
         shell: pwsh
         run: |
           $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-          
-          Write-Host "🔗 Connecting NetBird..."
           netbird up --setup-key $env:NETBIRD_SETUP_KEY
-          
           Start-Sleep -Seconds 10
-          
-          Write-Host "📊 NetBird status:"
           netbird status
 
       # ============================================
@@ -61,7 +46,6 @@ jobs:
       - name: Enable RDP
         shell: pwsh
         run: |
-          Write-Host "🖥️ Enabling RDP..."
           Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Write-Host "✅ RDP enabled"
@@ -72,23 +56,11 @@ jobs:
       - name: Setup Admin Account
         shell: pwsh
         run: |
-          Write-Host "🔍 Finding admin account..."
-          
           $adminUser = Get-LocalUser | Where-Object { $_.SID -like "S-1-5-21-*-500" } | Select-Object -First 1
-          
-          if ($adminUser) {
-            $adminName = $adminUser.Name
-          } else {
-            $adminName = "Administrator"
-          }
-          
-          Write-Host "✅ Admin user: $adminName"
-          
+          if ($adminUser) { $adminName = $adminUser.Name } else { $adminName = "Administrator" }
           $Password = ConvertTo-SecureString "Root@2024!" -AsPlainText -Force
           Set-LocalUser -Name $adminName -Password $Password
           Enable-LocalUser -Name $adminName
-          
-          Write-Host "✅ Password set for: $adminName"
           echo "ADMIN_USER=$adminName" >> $env:GITHUB_ENV
 
       # ============================================
@@ -97,7 +69,6 @@ jobs:
       - name: Install 7-Zip
         shell: pwsh
         run: |
-          Write-Host "📦 Installing 7-Zip (official)..."
           $url = "https://www.7-zip.org/a/7z2409-x64.exe"
           Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\7zip.exe" -UseBasicParsing
           Start-Process -FilePath "$env:TEMP\7zip.exe" -ArgumentList "/S" -Wait
@@ -110,20 +81,14 @@ jobs:
         shell: pwsh
         run: |
           $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-          
           $status = netbird status
-          Write-Host "NetBird status:"
-          Write-Host $status
-          
-          # Fixed parser to ignore the IPv6 line that broke your last run
           $ipLine = $status -split "`n" | Where-Object { $_ -match "NetBird IP:" -and $_ -notmatch "IPv6" } | Select-Object -First 1
           $NetBirdIP = ($ipLine -split "NetBird IP:")[1].Trim().Split("/")[0].Split(" ")[0]
-          
           Write-Host "📡 NetBird IP: $NetBirdIP"
           echo "NETBIRD_IP=$NetBirdIP" >> $env:GITHUB_ENV
 
       # ============================================
-      # 6.5 SMART REVERSE PROXY MANAGER (NEW)
+      # 6.5 PROXY MANAGER (UPDATE-ONLY, NEVER DELETE)
       # ============================================
       - name: Configure NetBird Reverse Proxy (gitwin)
         env:
@@ -134,122 +99,150 @@ jobs:
           $base  = "https://api.netbird.io"
           $h     = @{ Authorization = "Bearer $token"; Origin = "https://app.netbird.io"; Referer = "https://app.netbird.io/" }
 
-          $svcName = "gitwin.rs4.indevs.in"
-          $destIp  = $env:NETBIRD_IP
+          $svcName  = "gitwin.rs4.indevs.in"
+          $destIp   = $env:NETBIRD_IP
           $destPort = 3389
-          $mode    = "tcp"
+          $mode     = "tcp"
 
-          Write-Host "=== NetBird Reverse Proxy Setup ==="
-          Write-Host "Target Service: $svcName"
-          Write-Host "Target Peer IP: $destIp"
+          Write-Host "=== Reverse Proxy Setup (IP-based, update-only) ==="
+          Write-Host "Current runner IP: $destIp"
 
-          # 1. Wait for peer to be fully connected in the API
-          Write-Host "Waiting for peer to connect to NetBird management server..."
-          $maxWait = 60
-          $waited = 0
-          $peerConnected = $false
-          $tid = $null
+          # ---- 1. Wait for peer connect, get ID ----
+          $tid = $null; $waited = 0
+          while ($waited -lt 90) {
+              try {
+                  $peers = @(Invoke-RestMethod -Uri "$base/api/peers" -Headers $h)
+                  $myPeer = $peers | Where-Object { $_.ip -contains $destIp } | Select-Object -First 1
+                  if ($myPeer -and $myPeer.connected -eq $true) { $tid = ([string[]]$myPeer.id)[0]; break }
+              } catch {}
+              Write-Host "Peer not connected yet... waiting 5s"
+              Start-Sleep -Seconds 5; $waited += 5
+          }
+          if (-not $tid) { throw "Peer $destIp not found or not connected!" }
+          Write-Host "Peer CONNECTED. ID: $tid" -ForegroundColor Green
 
-          while ($waited -lt $maxWait) {
-              $peers = @(Invoke-RestMethod -Uri "$base/api/peers" -Headers $h)
-              $myPeer = $peers | Where-Object { $_.ip -contains $destIp } | Select-Object -First 1
-              
-              if ($myPeer) {
-                  $tid = ([string[]]$myPeer.id)[0]
-                  if ($myPeer.connected -eq $true) {
-                      $peerConnected = $true
-                      break
-                  }
-              }
-              Write-Host "Peer not connected yet. Waiting 5s..."
-              Start-Sleep -Seconds 5
-              $waited += 5
+          # ---- helper: fresh GET check (the API cannot lie) ----
+          function Test-TargetIsCurrent {
+              $svcs = @(Invoke-RestMethod -Uri "$base/api/reverse-proxies/services" -Headers $h)
+              $s = $svcs | Where-Object { $_.name -eq $svcName -or $_.domain -eq $svcName } | Select-Object -First 1
+              if (-not $s) { return $false }
+              $t2 = @($s.targets)
+              if ($t2.Count -eq 0) { return $false }
+              return ([string]$t2[0].host -eq $destIp)
           }
 
-          if (-not $tid) { throw "Peer with IP $destIp not found in NetBird account!" }
-          if (-not $peerConnected) {
-              Write-Host "WARNING: Peer did not show as connected within $maxWait seconds. Proceeding anyway..." -ForegroundColor Yellow
-          } else {
-              Write-Host "Peer is CONNECTED! ID: $tid" -ForegroundColor Green
-          }
-
-          # 2. Check if service exists
-          $allSvcs = @(Invoke-RestMethod -Uri "$base/api/reverse-proxies/services" -Headers $h)
+          # ---- 2. Does it exist? ----
+          $allSvcs  = @(Invoke-RestMethod -Uri "$base/api/reverse-proxies/services" -Headers $h)
           $existing = $allSvcs | Where-Object { $_.name -eq $svcName -or $_.domain -eq $svcName } | Select-Object -First 1
 
           if ($existing) {
-              Write-Host "Service $svcName exists. Checking target..."
               $existingId = ([string[]]$existing.id)[0]
-              
-              $targetsArray = @($existing.targets)
-              $currentTargetId = $null
-              if ($targetsArray.Count -gt 0) { $currentTargetId = ([string[]]$targetsArray[0].target_id)[0] }
-              
-              if ($currentTargetId -eq $tid) {
-                  Write-Host "Service already points to this runner. Nothing to do." -ForegroundColor Green
+              $ta = @($existing.targets)
+              $currentHost = $null
+              if ($ta.Count -gt 0) { $currentHost = [string]$ta[0].host }
+
+              if ($currentHost -eq $destIp) {
+                  Write-Host "✅ Already points to $destIp. Nothing to do." -ForegroundColor Green
               } else {
-                  Write-Host "Service points to different peer. Updating to current runner..." -ForegroundColor Yellow
-                  
-                  $body = $existing | ConvertTo-Json -Depth 12 | ConvertFrom-Json
-                  foreach ($k in @('id','meta','port_auto_assigned','listen_port')) {
-                      if ($body.PSObject.Properties[$k]) { $body.PSObject.Properties.Remove($k) }
+                  Write-Host "⚠️ Exists but points to OLD IP $currentHost. Updating route (NO delete)..." -ForegroundColor Yellow
+
+                  # keep public port stable
+                  $portAuto = $true; $listenPort = $null
+                  if ($existing.PSObject.Properties['port_auto_assigned']) { $portAuto = [bool]$existing.port_auto_assigned }
+                  if ($existing.PSObject.Properties['listen_port']) { $listenPort = $existing.listen_port }
+
+                  # explicit targets array (PS7-safe)
+                  $targetsArr = @( [ordered]@{
+                      enabled=$true; host=$destIp; port=[int]$destPort; protocol=$mode
+                      target_type="peer"; target_id=$tid; options=[pscustomobject]@{}
+                  } )
+
+                  $buildBody = {
+                      param($withId)
+                      $b = [ordered]@{
+                          name=$svcName; domain=$svcName; mode=$mode; enabled=$true; private=$false
+                          pass_host_header=$false; rewrite_redirects=$false; terminated=$false
+                          proxy_cluster="eu1.netbird.services"; auth=[pscustomobject]@{}
+                          port_auto_assigned=$portAuto; targets=$targetsArr
+                      }
+                      if (-not $portAuto -and $listenPort) { $b['listen_port'] = [int]$listenPort }
+                      if ($withId) { $b['id'] = $existingId }
+                      $b
                   }
-                  
-                  $t = @($body.targets)[0]
-                  $t.target_id = $tid
-                  $t.host = $destIp
-                  $json = $body | ConvertTo-Json -Depth 12
-                  
+
+                  $updated = $false
+
+                  # Strategy A: PUT full body
                   try {
-                      Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$existingId" -Headers $h -Method PUT -ContentType "application/json; charset=utf-8" -Body $json -ErrorAction Stop | Out-Null
-                      Write-Host "UPDATED! $svcName now points to $destIp`:$destPort" -ForegroundColor Green
-                  } catch {
-                      Write-Host "UPDATE failed: $($_.ErrorDetails.Message)" -ForegroundColor Red
+                      Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$existingId" -Headers $h -Method PUT -ContentType "application/json; charset=utf-8" -Body ((& $buildBody $false) | ConvertTo-Json -Depth 10) -ErrorAction Stop | Out-Null
+                      Start-Sleep -Seconds 2
+                      if (Test-TargetIsCurrent) { $updated = $true; Write-Host "✅ UPDATED via PUT." -ForegroundColor Green }
+                  } catch { Write-Host "PUT failed: $($_.ErrorDetails.Message)" -ForegroundColor Red }
+
+                  # Strategy B: PUT with id in body
+                  if (-not $updated) {
+                      try {
+                          Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$existingId" -Headers $h -Method PUT -ContentType "application/json; charset=utf-8" -Body ((& $buildBody $true) | ConvertTo-Json -Depth 10) -ErrorAction Stop | Out-Null
+                          Start-Sleep -Seconds 2
+                          if (Test-TargetIsCurrent) { $updated = $true; Write-Host "✅ UPDATED via PUT+id." -ForegroundColor Green }
+                      } catch { Write-Host "PUT+id failed: $($_.ErrorDetails.Message)" -ForegroundColor Red }
+                  }
+
+                  # Strategy C: PATCH minimal (targets only)
+                  if (-not $updated) {
+                      try {
+                          $patchJson = ([ordered]@{ targets = $targetsArr }) | ConvertTo-Json -Depth 10
+                          Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$existingId" -Headers $h -Method PATCH -ContentType "application/json; charset=utf-8" -Body $patchJson -ErrorAction Stop | Out-Null
+                          Start-Sleep -Seconds 2
+                          if (Test-TargetIsCurrent) { $updated = $true; Write-Host "✅ UPDATED via PATCH." -ForegroundColor Green }
+                      } catch { Write-Host "PATCH failed: $($_.ErrorDetails.Message)" -ForegroundColor Red }
+                  }
+
+                  if ($updated) {
+                      $final = @(Invoke-RestMethod -Uri "$base/api/reverse-proxies/services" -Headers $h) | Where-Object { $_.name -eq $svcName -or $_.domain -eq $svcName } | Select-Object -First 1
+                      Write-Host "🌐 Public URL: $($final.domain):$($final.listen_port) -> $destIp`:$destPort" -ForegroundColor Cyan
+                  } else {
+                      Write-Host "❌ ALL UPDATE METHODS FAILED. Service NOT deleted (per rule). It still points to $currentHost." -ForegroundColor Red
                   }
               }
           } else {
-              Write-Host "Service $svcName does not exist. Creating..." -ForegroundColor Yellow
-              
+              # ---- 3. Not exists -> CREATE (retry until healthy) ----
+              Write-Host "Service does not exist. Creating..." -ForegroundColor Yellow
               $attempt = 1
               while ($true) {
-                  Write-Host "Attempt $attempt..."
-                  
+                  Write-Host "CREATE attempt $attempt ..."
                   $tgt = [ordered]@{ enabled=$true; host=$destIp; port=$destPort; protocol=$mode; target_type="peer"; options=[pscustomobject]@{} }
                   $tgt.target_id = $tid
-                  
                   $body = [ordered]@{
                       name=$svcName; domain=$svcName; mode=$mode; enabled=$true; private=$false
-                      pass_host_header=$false; rewrite_redirects=$false; terminated=$false; proxy_cluster="eu1.netbird.services"
-                      auth=[pscustomobject]@{}; port_auto_assigned=$true; targets=@($tgt)
+                      pass_host_header=$false; rewrite_redirects=$false; terminated=$false
+                      proxy_cluster="eu1.netbird.services"; auth=[pscustomobject]@{}
+                      port_auto_assigned=$true; targets=@($tgt)
                   } | ConvertTo-Json -Depth 10
-                  
-                  $r = $null
+
+                  $newId = $null
                   try {
                       $r = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services" -Headers $h -Method POST -ContentType "application/json; charset=utf-8" -Body $body -ErrorAction Stop
+                      $newId = ([string[]]$r.id)[0]
                   } catch {
-                      Write-Host "Create failed: $($_.ErrorDetails.Message). Retrying in 5s..." -ForegroundColor Red
-                      Start-Sleep -Seconds 5
-                      $attempt++
-                      continue
+                      Write-Host "POST failed: $($_.ErrorDetails.Message)" -ForegroundColor Red
+                      Start-Sleep -Seconds 5; $attempt++; continue
                   }
-                  
-                  $newId = ([string[]]$r.id)[0]
-                  Write-Host "Created ID: $newId. Waiting 5s for agent status..."
+
                   Start-Sleep -Seconds 5
-                  
                   $status = "error"
                   try {
                       $check = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$newId" -Headers $h -Method GET -ErrorAction Stop
-                      $status = $check.meta.status
+                      $status = [string]$check.meta.status
                   } catch {}
-                  
+
                   if ($status -eq "error") {
-                      Write-Host "Status is ERROR. Deleting and retrying in 5s..." -ForegroundColor Red
+                      Write-Host "Status ERROR. Deleting bad attempt and retrying..." -ForegroundColor Red
                       try { Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$newId" -Headers $h -Method DELETE -ErrorAction SilentlyContinue | Out-Null } catch {}
-                      Start-Sleep -Seconds 5
-                      $attempt++
+                      Start-Sleep -Seconds 5; $attempt++
                   } else {
-                      Write-Host "SUCCESS! Status is $status. Service created." -ForegroundColor Green
+                      Write-Host "✅ SUCCESS! $svcName -> $destIp`:$destPort (status: $status)" -ForegroundColor Green
+                      Write-Host "🌐 Public URL: $($check.domain):$($check.listen_port)" -ForegroundColor Cyan
                       break
                   }
               }
