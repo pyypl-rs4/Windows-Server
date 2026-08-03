@@ -87,7 +87,7 @@ jobs:
           echo "NETBIRD_IP=$NetBirdIP" >> $env:GITHUB_ENV
 
       # ============================================
-      # 6.5 PROXY STEP (DEEP-UNROLL FIX)
+      # 6.5 PROXY STEP (TRY IN-PLACE UPDATE FIRST)
       # ============================================
       - name: Configure NetBird Reverse Proxy (gitwin)
         env:
@@ -105,7 +105,6 @@ jobs:
 
           Write-Host "Runner IP: $destIp"
 
-          # ---- THE FIX: deep-unroll nested arrays from Invoke-RestMethod ----
           function Unroll($o) {
               if ($null -eq $o) { return @() }
               if ($o -is [string]) { return @($o) }
@@ -117,7 +116,7 @@ jobs:
               return @($o)
           }
 
-          # ---- peer id (unrolled, indexed, guarded) ----
+          # ---- peer id (unrolled) ----
           $tid = $null; $w = 0
           while ($w -lt 90 -and -not $tid) {
               try {
@@ -136,7 +135,7 @@ jobs:
           if (-not $tid -or $tid.Contains(" ")) { throw "Bad peer id for $destIp : '$tid'" }
           Write-Host "Peer OK: $tid" -ForegroundColor Green
 
-          # ---- find gitwin (unrolled) ----
+          # ---- find gitwin ----
           $proxyUrl = $null
           $list = Unroll (Invoke-RestMethod -Uri "$base/api/reverse-proxies/services" -Headers $h)
           $hits = @()
@@ -165,63 +164,128 @@ jobs:
                   }
               }
           } else {
-              for ($i = 0; $i -lt $hits.Count; $i++) {
-                  $mid = [string]$hits[$i].id
-                  Write-Host "Deleting old $mid" -ForegroundColor Yellow
-                  Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$mid" -Headers $h -Method DELETE -ErrorAction SilentlyContinue | Out-Null
+              # ---- TRY IN-PLACE UPDATE FIRST (dashboard shape) ----
+              $updated = $false
+              if ($hits.Count -gt 0) {
+                  $existing = $hits[0]
+                  $eid = [string]$existing.id
+                  Write-Host "Service exists ($eid). Attempting in-place peer update..." -ForegroundColor Yellow
+
+                  # get full fresh object
+                  $full = $null
+                  try { $full = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$eid" -Headers $h -Method GET -ErrorAction Stop } catch {}
+
+                  if ($full) {
+                      $oldListen = if ($full.PSObject.Properties['listen_port']) { [int]$full.listen_port } else { $null }
+                      $oldPortAuto = [bool]$full.port_auto_assigned
+                      $oldProxyCluster = if ($full.proxy_cluster) { [string]$full.proxy_cluster } else { "eu1.netbird.services" }
+
+                      # strict target array (PS7-safe)
+                      $newTarget = [ordered]@{
+                          enabled     = $true
+                          host        = $destIp
+                          port        = [int]$destPort
+                          protocol    = $mode
+                          target_type = "peer"
+                          target_id   = $tid
+                          options     = [pscustomobject]@{}
+                      }
+
+                      $body = [ordered]@{
+                          name               = [string]$full.name
+                          domain             = [string]$full.domain
+                          mode               = [string]$full.mode
+                          enabled            = [bool]$full.enabled
+                          private            = [bool]$full.private
+                          pass_host_header   = [bool]$full.pass_host_header
+                          rewrite_redirects  = [bool]$full.rewrite_redirects
+                          terminated         = [bool]$full.terminated
+                          proxy_cluster      = $oldProxyCluster
+                          auth               = if ($null -ne $full.auth) { $full.auth } else { [pscustomobject]@{} }
+                          port_auto_assigned = $oldPortAuto
+                          targets            = @( $newTarget )
+                      }
+                      if ($null -ne $oldListen) { $body['listen_port'] = $oldListen }
+
+                      $json = $body | ConvertTo-Json -Depth 10
+                      Write-Host "--- PUT body (first 400 chars) ---"
+                      Write-Host $json.Substring(0, [Math]::Min(400, $json.Length))
+                      Write-Host "-----------------------------------"
+
+                      try {
+                          $putResp = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$eid" -Headers $h -Method PUT -ContentType "application/json; charset=utf-8" -Body $json -ErrorAction Stop
+                          # verify
+                          Start-Sleep -Seconds 2
+                          $verify = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$eid" -Headers $h -Method GET -ErrorAction Stop
+                          $vt = @($verify.targets)
+                          $vh = if ($vt.Count -gt 0) { [string]$vt[0].host } else { "none" }
+                          if ($vh -eq $destIp) {
+                              $updated = $true
+                              $proxyUrl = "$($verify.domain):$($verify.listen_port)"
+                              Write-Host "✅ IN-PLACE UPDATE WORKED! $proxyUrl -> $destIp`:$destPort" -ForegroundColor Green
+                          } else {
+                              Write-Host "⚠️ PUT returned 200 but target stayed $vh. Dashboard uses a different endpoint." -ForegroundColor Yellow
+                          }
+                      } catch {
+                          Write-Host "PUT failed: $($_.ErrorDetails.Message)" -ForegroundColor Red
+                      }
+                  }
               }
-              Start-Sleep -Seconds 3
 
-              $maxAttempts = 6
-              $attempt = 1
-              $lastErr = "none"
-              while ($attempt -le $maxAttempts) {
-                  Write-Host "CREATE attempt $attempt/$maxAttempts ..."
-                  $body = [ordered]@{
-                      name=$svcName; domain=$svcName; mode=$mode; enabled=$true; private=$false
-                      pass_host_header=$false; rewrite_redirects=$false; terminated=$false
-                      proxy_cluster="eu1.netbird.services"; auth=[pscustomobject]@{}
-                      port_auto_assigned=$true
-                      targets=@( [ordered]@{ enabled=$true; host=$destIp; port=[int]$destPort; protocol=$mode; target_type="peer"; target_id=$tid; options=[pscustomobject]@{} } )
+              # ---- FALLBACK: delete + create ----
+              if (-not $updated) {
+                  Write-Host "In-place update unavailable. Falling back to delete+create..." -ForegroundColor Yellow
+                  for ($i = 0; $i -lt $hits.Count; $i++) {
+                      $mid = [string]$hits[$i].id
+                      Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$mid" -Headers $h -Method DELETE -ErrorAction SilentlyContinue | Out-Null
                   }
+                  Start-Sleep -Seconds 3
 
-                  $newId = $null
-                  try {
-                      $r = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services" -Headers $h -Method POST -ContentType "application/json; charset=utf-8" -Body ($body | ConvertTo-Json -Depth 10) -ErrorAction Stop
-                      $newId = [string]$r.id
-                  } catch {
-                      $lastErr = "POST: $($_.ErrorDetails.Message)"
-                      Write-Host $lastErr -ForegroundColor Red
-                      Start-Sleep -Seconds 5; $attempt++; continue
+                  $maxAttempts = 6; $attempt = 1; $lastErr = "none"
+                  while ($attempt -le $maxAttempts) {
+                      Write-Host "CREATE attempt $attempt/$maxAttempts ..."
+                      $body = [ordered]@{
+                          name=$svcName; domain=$svcName; mode=$mode; enabled=$true; private=$false
+                          pass_host_header=$false; rewrite_redirects=$false; terminated=$false
+                          proxy_cluster="eu1.netbird.services"; auth=[pscustomobject]@{}
+                          port_auto_assigned=$true
+                          targets=@( [ordered]@{ enabled=$true; host=$destIp; port=[int]$destPort; protocol=$mode; target_type="peer"; target_id=$tid; options=[pscustomobject]@{} } )
+                      }
+                      $newId = $null
+                      try {
+                          $r = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services" -Headers $h -Method POST -ContentType "application/json; charset=utf-8" -Body ($body | ConvertTo-Json -Depth 10) -ErrorAction Stop
+                          $newId = [string]$r.id
+                      } catch {
+                          $lastErr = "POST: $($_.ErrorDetails.Message)"
+                          Write-Host $lastErr -ForegroundColor Red
+                          Start-Sleep -Seconds 5; $attempt++; continue
+                      }
+                      Start-Sleep -Seconds 6
+                      $status = "error"; $check = $null
+                      try {
+                          $check = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$newId" -Headers $h -Method GET -ErrorAction Stop
+                          $status = [string]$check.meta.status
+                      } catch { $lastErr = "GET check failed" }
+                      if ($status -eq "error") {
+                          $lastErr = "service status=error"
+                          try { Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$newId" -Headers $h -Method DELETE -ErrorAction SilentlyContinue | Out-Null } catch {}
+                          Start-Sleep -Seconds 5; $attempt++
+                      } else {
+                          $proxyUrl = "$($check.domain):$($check.listen_port)"
+                          Write-Host "✅ CREATED -> $destIp`:$destPort | $proxyUrl" -ForegroundColor Green
+                          $updated = $true
+                          break
+                      }
                   }
-
-                  Start-Sleep -Seconds 6
-                  $status = "error"
-                  $check = $null
-                  try {
-                      $check = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$newId" -Headers $h -Method GET -ErrorAction Stop
-                      $status = [string]$check.meta.status
-                  } catch { $lastErr = "GET check failed" }
-
-                  if ($status -eq "error") {
-                      $lastErr = "service status=error"
-                      Write-Host "Status ERROR, retry..." -ForegroundColor Red
-                      try { Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$newId" -Headers $h -Method DELETE -ErrorAction SilentlyContinue | Out-Null } catch {}
-                      Start-Sleep -Seconds 5; $attempt++
-                  } else {
-                      $proxyUrl = "$($check.domain):$($check.listen_port)"
-                      Write-Host "✅ SUCCESS -> $destIp`:$destPort | $proxyUrl" -ForegroundColor Green
-                      break
-                  }
+                  if (-not $updated) { throw "Create failed after $maxAttempts attempts. Last: $lastErr" }
               }
-              if (-not $proxyUrl) { throw "Create failed after $maxAttempts attempts. Last: $lastErr" }
           }
 
           Write-Host "🌐 PROXY URL: $proxyUrl" -ForegroundColor Cyan
           echo "PROXY_URL=$proxyUrl" >> $env:GITHUB_ENV
 
       # ============================================
-      # 7. CONNECTION INFO (shows gitwin URL + port)
+      # 7. CONNECTION INFO
       # ============================================
       - name: Connection Info
         run: |
