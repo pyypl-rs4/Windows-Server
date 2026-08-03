@@ -87,7 +87,7 @@ jobs:
           echo "NETBIRD_IP=$NetBirdIP" >> $env:GITHUB_ENV
 
       # ============================================
-      # 6.5 PROXY STEP (ONLY WHAT WAS ASKED)
+      # 6.5 PROXY STEP (DELETE + CREATE, KEEP PORT)
       # ============================================
       - name: Configure NetBird Reverse Proxy (gitwin)
         env:
@@ -118,39 +118,81 @@ jobs:
           if (-not $tid) { throw "Peer $destIp not connected!" }
           Write-Host "Peer OK: $tid" -ForegroundColor Green
 
-          # ---- exists? ----
-          $svc = @(Invoke-RestMethod -Uri "$base/api/reverse-proxies/services" -Headers $h) |
-                 Where-Object { $_.name -eq $svcName -or $_.domain -eq $svcName } | Select-Object -First 1
+          $proxyUrl = $null
+          $hits = @(@(Invoke-RestMethod -Uri "$base/api/reverse-proxies/services" -Headers $h) | Where-Object { $_.name -eq $svcName -or $_.domain -eq $svcName })
+          $routed = $hits | Where-Object { $t = @($_.targets); ($t.Count -gt 0) -and ([string]$t[0].host -eq $destIp) } | Select-Object -First 1
 
-          if ($svc) {
-              # EXISTS -> route peer to yml ip (port stays whatever the service already has)
-              $id = ([string[]]$svc.id)[0]
-              $b = ($svc | ConvertTo-Json -Depth 12) | ConvertFrom-Json
-              foreach ($k in @('id','meta')) { if ($b.PSObject.Properties[$k]) { $b.PSObject.Properties.Remove($k) } }
-              $b.targets = @( [ordered]@{ enabled=$true; host=$destIp; port=[int]$destPort; protocol=$mode; target_type="peer"; target_id=$tid; options=[pscustomobject]@{} } )
-
-              Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$id" -Headers $h -Method PUT `
-                  -ContentType "application/json; charset=utf-8" -Body ($b | ConvertTo-Json -Depth 12) | Out-Null
-
-              $now = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$id" -Headers $h -Method GET
-              $nh = [string]@($now.targets)[0].host
-              Write-Host "Service now targets: $nh (wanted $destIp) | public: $($now.domain):$($now.listen_port)" -ForegroundColor Cyan
-          } else {
-              # NOT EXISTS -> create for yml ip (server assigns port)
-              $body = [ordered]@{
-                  name=$svcName; domain=$svcName; mode=$mode; enabled=$true; private=$false
-                  pass_host_header=$false; rewrite_redirects=$false; terminated=$false
-                  proxy_cluster="eu1.netbird.services"; auth=[pscustomobject]@{}
-                  port_auto_assigned=$true
-                  targets=@( [ordered]@{ enabled=$true; host=$destIp; port=[int]$destPort; protocol=$mode; target_type="peer"; target_id=$tid; options=[pscustomobject]@{} } )
+          if ($routed) {
+              # already routed -> keep it, clean duplicates
+              $full = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$([string[]]$routed.id)[0]" -Headers $h -Method GET
+              $proxyUrl = "$($full.domain):$($full.listen_port)"
+              Write-Host "✅ Already routed. Keeping $proxyUrl" -ForegroundColor Green
+              foreach ($dup in $hits) {
+                  if (([string[]]$dup.id)[0] -ne ([string[]]$routed.id)[0]) {
+                      Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$([string[]]$dup.id)[0]" -Headers $h -Method DELETE -ErrorAction SilentlyContinue | Out-Null
+                  }
               }
-              $r = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services" -Headers $h -Method POST `
-                   -ContentType "application/json; charset=utf-8" -Body ($body | ConvertTo-Json -Depth 10)
-              Write-Host "Created: $($r.domain):$($r.listen_port) -> $destIp" -ForegroundColor Green
+          } else {
+              # delete old (carry its port), create new for this IP
+              $oldPort = $null
+              if ($hits.Count -gt 0) {
+                  $full = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$([string[]]$hits[0].id)[0]" -Headers $h -Method GET
+                  if ($full.PSObject.Properties['listen_port']) { $oldPort = $full.listen_port }
+                  foreach ($m in $hits) {
+                      Write-Host "Deleting old $(([string[]]$m.id)[0])" -ForegroundColor Yellow
+                      Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$([string[]]$m.id)[0]" -Headers $h -Method DELETE -ErrorAction SilentlyContinue | Out-Null
+                  }
+                  Start-Sleep -Seconds 3
+              }
+
+              $attempt = 1; $useOld = ($null -ne $oldPort)
+              while ($true) {
+                  $pl = if ($useOld) { [string]$oldPort } else { "auto" }
+                  Write-Host "CREATE attempt $attempt (port $pl)..."
+                  $body = [ordered]@{
+                      name=$svcName; domain=$svcName; mode=$mode; enabled=$true; private=$false
+                      pass_host_header=$false; rewrite_redirects=$false; terminated=$false
+                      proxy_cluster="eu1.netbird.services"; auth=[pscustomobject]@{}
+                      port_auto_assigned=(-not $useOld)
+                      targets=@( [ordered]@{ enabled=$true; host=$destIp; port=[int]$destPort; protocol=$mode; target_type="peer"; target_id=$tid; options=[pscustomobject]@{} } )
+                  }
+                  if ($useOld) { $body.listen_port = [int]$oldPort }
+
+                  $newId = $null
+                  try {
+                      $r = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services" -Headers $h -Method POST -ContentType "application/json; charset=utf-8" -Body ($body | ConvertTo-Json -Depth 10) -ErrorAction Stop
+                      $newId = ([string[]]$r.id)[0]
+                  } catch {
+                      Write-Host "POST failed: $($_.ErrorDetails.Message)" -ForegroundColor Red
+                      if ($useOld -and $attempt -ge 2) { $useOld = $false }
+                      Start-Sleep -Seconds 5; $attempt++; continue
+                  }
+
+                  Start-Sleep -Seconds 5
+                  $status = "error"
+                  $check = $null
+                  try {
+                      $check = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$newId" -Headers $h -Method GET -ErrorAction Stop
+                      $status = [string]$check.meta.status
+                  } catch {}
+
+                  if ($status -eq "error") {
+                      Write-Host "Status ERROR, retry..." -ForegroundColor Red
+                      try { Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$newId" -Headers $h -Method DELETE -ErrorAction SilentlyContinue | Out-Null } catch {}
+                      Start-Sleep -Seconds 5; $attempt++
+                  } else {
+                      $proxyUrl = "$($check.domain):$($check.listen_port)"
+                      Write-Host "✅ SUCCESS -> $destIp`:$destPort | $proxyUrl" -ForegroundColor Green
+                      break
+                  }
+              }
           }
 
+          Write-Host "🌐 PROXY URL: $proxyUrl" -ForegroundColor Cyan
+          echo "PROXY_URL=$proxyUrl" >> $env:GITHUB_ENV
+
       # ============================================
-      # 7. CONNECTION INFO
+      # 7. CONNECTION INFO (shows gitwin URL + port)
       # ============================================
       - name: Connection Info
         run: |
@@ -159,6 +201,8 @@ jobs:
           echo "=========================================="
           echo ""
           echo "📡 NetBird IP: ${{ env.NETBIRD_IP }}"
+          echo ""
+          echo "🌐 PROXY URL: ${{ env.PROXY_URL }}"
           echo ""
           echo "🖥️ RDP (port 3389):"
           echo "  Address: ${{ env.NETBIRD_IP }}:3389"
@@ -183,6 +227,7 @@ jobs:
           echo "✅ NetBird: CONNECTED"
           echo "✅ RDP: ACTIVE on 3389"
           echo "✅ 7-Zip: INSTALLED"
+          echo "🌐 Proxy: ${{ env.PROXY_URL }}"
           echo ""
           echo "♾️ Keeping alive forever..."
           while ($true) { Start-Sleep -Seconds 60 }
