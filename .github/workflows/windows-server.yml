@@ -87,7 +87,7 @@ jobs:
           echo "NETBIRD_IP=$NetBirdIP" >> $env:GITHUB_ENV
 
       # ============================================
-      # 6.5 PROXY STEP (DELETE + CREATE, AUTO PORT)
+      # 6.5 PROXY STEP (BULLETPROOF ID + CAPPED)
       # ============================================
       - name: Configure NetBird Reverse Proxy (gitwin)
         env:
@@ -105,27 +105,44 @@ jobs:
 
           Write-Host "Runner IP: $destIp"
 
-          # ---- peer id from ip ----
-          $tid = $null; $w = 0
-          while ($w -lt 90) {
+          # ---- peer id: plain indexed loop, NO pipelines (kills the space-joined bug) ----
+          $tid = $null
+          $w = 0
+          while ($w -lt 90 -and -not $tid) {
               try {
                   $peers = @(Invoke-RestMethod -Uri "$base/api/peers" -Headers $h)
-                  $p = $peers | Where-Object { $_.ip -contains $destIp } | Select-Object -First 1
-                  if ($p -and $p.connected -eq $true) { $tid = [string]$p.id; break }
+                  for ($i = 0; $i -lt $peers.Count; $i++) {
+                      $one = $peers[$i]
+                      $ips = @($one.ip)
+                      for ($j = 0; $j -lt $ips.Count; $j++) {
+                          if ([string]$ips[$j] -eq $destIp -and $one.connected -eq $true) {
+                              $tid = [string]$one.id
+                              break
+                          }
+                      }
+                      if ($tid) { break }
+                  }
               } catch {}
-              Start-Sleep -Seconds 5; $w += 5
+              if (-not $tid) { Start-Sleep -Seconds 5; $w += 5 }
           }
-          if (-not $tid) { throw "Peer $destIp not connected!" }
+          # GUARD: never allow empty or space-joined id
+          if (-not $tid -or $tid.Contains(" ")) { throw "Bad peer id for $destIp : '$tid'" }
           Write-Host "Peer OK: $tid" -ForegroundColor Green
 
           # ---- find gitwin ----
           $proxyUrl = $null
           $list = @(Invoke-RestMethod -Uri "$base/api/reverse-proxies/services" -Headers $h)
-          $hits = @($list | Where-Object { $_.name -eq $svcName -or $_.domain -eq $svcName })
-          $routed = $hits | Where-Object { $t = @($_.targets); ($t.Count -gt 0) -and ([string]$t[0].host -eq $destIp) } | Select-Object -First 1
+          $hits = @()
+          for ($i = 0; $i -lt $list.Count; $i++) {
+              if ([string]$list[$i].name -eq $svcName -or [string]$list[$i].domain -eq $svcName) { $hits += $list[$i] }
+          }
+          $routed = $null
+          for ($i = 0; $i -lt $hits.Count; $i++) {
+              $tt = @($hits[$i].targets)
+              if ($tt.Count -gt 0 -and [string]$tt[0].host -eq $destIp) { $routed = $hits[$i]; break }
+          }
 
           if ($routed) {
-              # already routed -> keep it, clean duplicates
               $rid = [string]$routed.id
               try {
                   $full = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$rid" -Headers $h -Method GET -ErrorAction Stop
@@ -134,24 +151,25 @@ jobs:
                   $proxyUrl = [string]$routed.domain
               }
               Write-Host "✅ Already routed. Keeping $proxyUrl" -ForegroundColor Green
-              foreach ($dup in $hits) {
-                  $did = [string]$dup.id
+              for ($i = 0; $i -lt $hits.Count; $i++) {
+                  $did = [string]$hits[$i].id
                   if ($did -ne $rid) {
                       Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$did" -Headers $h -Method DELETE -ErrorAction SilentlyContinue | Out-Null
                   }
               }
           } else {
-              # delete old, create new for this IP (auto port = always bindable)
-              foreach ($m in $hits) {
-                  $mid = [string]$m.id
+              for ($i = 0; $i -lt $hits.Count; $i++) {
+                  $mid = [string]$hits[$i].id
                   Write-Host "Deleting old $mid" -ForegroundColor Yellow
                   Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$mid" -Headers $h -Method DELETE -ErrorAction SilentlyContinue | Out-Null
               }
               Start-Sleep -Seconds 3
 
+              $maxAttempts = 6
               $attempt = 1
-              while ($true) {
-                  Write-Host "CREATE attempt $attempt (auto port)..."
+              $lastErr = "none"
+              while ($attempt -le $maxAttempts) {
+                  Write-Host "CREATE attempt $attempt/$maxAttempts ..."
                   $body = [ordered]@{
                       name=$svcName; domain=$svcName; mode=$mode; enabled=$true; private=$false
                       pass_host_header=$false; rewrite_redirects=$false; terminated=$false
@@ -165,19 +183,21 @@ jobs:
                       $r = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services" -Headers $h -Method POST -ContentType "application/json; charset=utf-8" -Body ($body | ConvertTo-Json -Depth 10) -ErrorAction Stop
                       $newId = [string]$r.id
                   } catch {
-                      Write-Host "POST failed: $($_.ErrorDetails.Message)" -ForegroundColor Red
+                      $lastErr = "POST: $($_.ErrorDetails.Message)"
+                      Write-Host $lastErr -ForegroundColor Red
                       Start-Sleep -Seconds 5; $attempt++; continue
                   }
 
-                  Start-Sleep -Seconds 5
+                  Start-Sleep -Seconds 6
                   $status = "error"
                   $check = $null
                   try {
                       $check = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$newId" -Headers $h -Method GET -ErrorAction Stop
                       $status = [string]$check.meta.status
-                  } catch {}
+                  } catch { $lastErr = "GET check failed" }
 
                   if ($status -eq "error") {
+                      $lastErr = "service status=error"
                       Write-Host "Status ERROR, retry..." -ForegroundColor Red
                       try { Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$newId" -Headers $h -Method DELETE -ErrorAction SilentlyContinue | Out-Null } catch {}
                       Start-Sleep -Seconds 5; $attempt++
@@ -187,6 +207,7 @@ jobs:
                       break
                   }
               }
+              if (-not $proxyUrl) { throw "Create failed after $maxAttempts attempts. Last: $lastErr" }
           }
 
           Write-Host "🌐 PROXY URL: $proxyUrl" -ForegroundColor Cyan
