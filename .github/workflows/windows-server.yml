@@ -20,11 +20,21 @@ jobs:
         shell: pwsh
         run: |
           Write-Host "📥 Fetching latest NetBird release..."
+
+          # Get latest release JSON
           $release = Invoke-WebRequest -Uri "https://api.github.com/repos/netbirdio/netbird/releases/latest" -UseBasicParsing | ConvertFrom-Json
+
+          # Find Windows MSI asset
           $asset = $release.assets | Where-Object { $_.name -like "*windows_amd64.msi" } | Select-Object -First 1
+
           $NetBirdUrl = $asset.browser_download_url
+          Write-Host "🔗 Latest NetBird URL: $NetBirdUrl"
+
           Invoke-WebRequest -Uri $NetBirdUrl -OutFile "$env:TEMP\netbird.msi" -UseBasicParsing
+
+          Write-Host "📦 Installing NetBird..."
           Start-Process msiexec -Wait -ArgumentList "/i `"$env:TEMP\netbird.msi`" /quiet /norestart"
+
           Write-Host "✅ NetBird installed"
 
       # ============================================
@@ -36,8 +46,13 @@ jobs:
         shell: pwsh
         run: |
           $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+          
+          Write-Host "🔗 Connecting NetBird..."
           netbird up --setup-key $env:NETBIRD_SETUP_KEY
+          
           Start-Sleep -Seconds 10
+          
+          Write-Host "📊 NetBird status:"
           netbird status
 
       # ============================================
@@ -46,6 +61,7 @@ jobs:
       - name: Enable RDP
         shell: pwsh
         run: |
+          Write-Host "🖥️ Enabling RDP..."
           Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Write-Host "✅ RDP enabled"
@@ -56,11 +72,23 @@ jobs:
       - name: Setup Admin Account
         shell: pwsh
         run: |
+          Write-Host "🔍 Finding admin account..."
+          
           $adminUser = Get-LocalUser | Where-Object { $_.SID -like "S-1-5-21-*-500" } | Select-Object -First 1
-          if ($adminUser) { $adminName = $adminUser.Name } else { $adminName = "Administrator" }
+          
+          if ($adminUser) {
+            $adminName = $adminUser.Name
+          } else {
+            $adminName = "Administrator"
+          }
+          
+          Write-Host "✅ Admin user: $adminName"
+          
           $Password = ConvertTo-SecureString "Root@2024!" -AsPlainText -Force
           Set-LocalUser -Name $adminName -Password $Password
           Enable-LocalUser -Name $adminName
+          
+          Write-Host "✅ Password set for: $adminName"
           echo "ADMIN_USER=$adminName" >> $env:GITHUB_ENV
 
       # ============================================
@@ -69,6 +97,7 @@ jobs:
       - name: Install 7-Zip
         shell: pwsh
         run: |
+          Write-Host "📦 Installing 7-Zip (official)..."
           $url = "https://www.7-zip.org/a/7z2409-x64.exe"
           Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\7zip.exe" -UseBasicParsing
           Start-Process -FilePath "$env:TEMP\7zip.exe" -ArgumentList "/S" -Wait
@@ -81,9 +110,15 @@ jobs:
         shell: pwsh
         run: |
           $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+          
           $status = netbird status
+          Write-Host "NetBird status:"
+          Write-Host $status
+          
+          # Fixed parser: ignores IPv6 line, strips CIDR mask
           $ipLine = $status -split "`n" | Where-Object { $_ -match "NetBird IP:" -and $_ -notmatch "IPv6" } | Select-Object -First 1
           $NetBirdIP = ($ipLine -split "NetBird IP:")[1].Trim().Split("/")[0].Split(" ")[0]
+          
           Write-Host "📡 NetBird IP: $NetBirdIP"
           echo "NETBIRD_IP=$NetBirdIP" >> $env:GITHUB_ENV
 
@@ -121,88 +156,79 @@ jobs:
           if (-not $tid) { throw "Peer $destIp not found or not connected!" }
           Write-Host "Peer CONNECTED. ID: $tid" -ForegroundColor Green
 
-          # ---- helper: fresh GET check (the API cannot lie) ----
-          function Test-TargetIsCurrent {
-              $svcs = @(Invoke-RestMethod -Uri "$base/api/reverse-proxies/services" -Headers $h)
-              $s = $svcs | Where-Object { $_.name -eq $svcName -or $_.domain -eq $svcName } | Select-Object -First 1
-              if (-not $s) { return $false }
-              $t2 = @($s.targets)
-              if ($t2.Count -eq 0) { return $false }
-              return ([string]$t2[0].host -eq $destIp)
-          }
-
           # ---- 2. Does it exist? ----
           $allSvcs  = @(Invoke-RestMethod -Uri "$base/api/reverse-proxies/services" -Headers $h)
           $existing = $allSvcs | Where-Object { $_.name -eq $svcName -or $_.domain -eq $svcName } | Select-Object -First 1
 
           if ($existing) {
-              $existingId = ([string[]]$existing.id)[0]
+              $existingId  = ([string[]]$existing.id)[0]
               $ta = @($existing.targets)
               $currentHost = $null
               if ($ta.Count -gt 0) { $currentHost = [string]$ta[0].host }
+              Write-Host "Service ID: $existingId | current target: $currentHost" -ForegroundColor Cyan
 
               if ($currentHost -eq $destIp) {
                   Write-Host "✅ Already points to $destIp. Nothing to do." -ForegroundColor Green
               } else {
-                  Write-Host "⚠️ Exists but points to OLD IP $currentHost. Updating route (NO delete)..." -ForegroundColor Yellow
+                  Write-Host "⚠️ OLD IP detected. Updating route (NO delete)..." -ForegroundColor Yellow
 
-                  # keep public port stable
-                  $portAuto = $true; $listenPort = $null
-                  if ($existing.PSObject.Properties['port_auto_assigned']) { $portAuto = [bool]$existing.port_auto_assigned }
-                  if ($existing.PSObject.Properties['listen_port']) { $listenPort = $existing.listen_port }
+                  # --- update sender with full debug + verify-by-id ---
+                  function Send-Update {
+                      param($label, $bodyObj)
+                      $j = $bodyObj | ConvertTo-Json -Depth 12
+                      try {
+                          $r = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$existingId" -Headers $h -Method PUT -ContentType "application/json; charset=utf-8" -Body $j -ErrorAction Stop
+                          $rt = @($r.targets)
+                          $rh = if ($rt.Count -gt 0) { [string]$rt[0].host } else { "none" }
+                          Write-Host "$label -> server response target: $rh" -ForegroundColor Cyan
+                          $g = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$existingId" -Headers $h -Method GET -ErrorAction Stop
+                          $gt = @($g.targets)
+                          $gh = if ($gt.Count -gt 0) { [string]$gt[0].host } else { "none" }
+                          if ($gh -eq $destIp) { Write-Host "✅ UPDATED via $label (verified by GET)." -ForegroundColor Green; return $true }
+                          Write-Host "$label NOT applied (GET still shows $gh)." -ForegroundColor Yellow
+                          return $false
+                      } catch {
+                          Write-Host "$label FAILED $([int]$_.Exception.Response.StatusCode): $($_.ErrorDetails.Message)" -ForegroundColor Red
+                          return $false
+                      }
+                  }
 
-                  # explicit targets array (PS7-safe)
-                  $targetsArr = @( [ordered]@{
-                      enabled=$true; host=$destIp; port=[int]$destPort; protocol=$mode
-                      target_type="peer"; target_id=$tid; options=[pscustomobject]@{}
-                  } )
+                  $newTarget = [ordered]@{ enabled=$true; host=$destIp; port=[int]$destPort; protocol=$mode; target_type="peer"; target_id=$tid; options=[pscustomobject]@{} }
+                  $updated = $false
 
-                  $buildBody = {
-                      param($withId)
-                      $b = [ordered]@{
+                  # V1: server's OWN object, modify only the target (proven shape)
+                  if (-not $updated) {
+                      $b1 = ($existing | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+                      foreach ($k in @('id','meta')) { if ($b1.PSObject.Properties[$k]) { $b1.PSObject.Properties.Remove($k) } }
+                      $b1.targets = @( $b1.targets )   # PS7 array re-wrap fix
+                      $b1.targets[0].target_id = $tid
+                      $b1.targets[0].host = $destIp
+                      $updated = Send-Update "V1(get-modify-put)" $b1
+                  }
+
+                  # V2: explicit body WITH listen_port pinned (keeps public URL)
+                  if (-not $updated) {
+                      $b2 = [ordered]@{
                           name=$svcName; domain=$svcName; mode=$mode; enabled=$true; private=$false
                           pass_host_header=$false; rewrite_redirects=$false; terminated=$false
                           proxy_cluster="eu1.netbird.services"; auth=[pscustomobject]@{}
-                          port_auto_assigned=$portAuto; targets=$targetsArr
+                          port_auto_assigned=$false; listen_port=[int]$existing.listen_port
+                          targets=@( $newTarget )
                       }
-                      if (-not $portAuto -and $listenPort) { $b['listen_port'] = [int]$listenPort }
-                      if ($withId) { $b['id'] = $existingId }
-                      $b
+                      $updated = Send-Update "V2(explicit+port)" $b2
                   }
 
-                  $updated = $false
-
-                  # Strategy A: PUT full body
-                  try {
-                      Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$existingId" -Headers $h -Method PUT -ContentType "application/json; charset=utf-8" -Body ((& $buildBody $false) | ConvertTo-Json -Depth 10) -ErrorAction Stop | Out-Null
-                      Start-Sleep -Seconds 2
-                      if (Test-TargetIsCurrent) { $updated = $true; Write-Host "✅ UPDATED via PUT." -ForegroundColor Green }
-                  } catch { Write-Host "PUT failed: $($_.ErrorDetails.Message)" -ForegroundColor Red }
-
-                  # Strategy B: PUT with id in body
+                  # V3: targets-only
                   if (-not $updated) {
-                      try {
-                          Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$existingId" -Headers $h -Method PUT -ContentType "application/json; charset=utf-8" -Body ((& $buildBody $true) | ConvertTo-Json -Depth 10) -ErrorAction Stop | Out-Null
-                          Start-Sleep -Seconds 2
-                          if (Test-TargetIsCurrent) { $updated = $true; Write-Host "✅ UPDATED via PUT+id." -ForegroundColor Green }
-                      } catch { Write-Host "PUT+id failed: $($_.ErrorDetails.Message)" -ForegroundColor Red }
-                  }
-
-                  # Strategy C: PATCH minimal (targets only)
-                  if (-not $updated) {
-                      try {
-                          $patchJson = ([ordered]@{ targets = $targetsArr }) | ConvertTo-Json -Depth 10
-                          Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$existingId" -Headers $h -Method PATCH -ContentType "application/json; charset=utf-8" -Body $patchJson -ErrorAction Stop | Out-Null
-                          Start-Sleep -Seconds 2
-                          if (Test-TargetIsCurrent) { $updated = $true; Write-Host "✅ UPDATED via PATCH." -ForegroundColor Green }
-                      } catch { Write-Host "PATCH failed: $($_.ErrorDetails.Message)" -ForegroundColor Red }
+                      $b3 = [ordered]@{ targets=@( $newTarget ) }
+                      $updated = Send-Update "V3(targets-only)" $b3
                   }
 
                   if ($updated) {
-                      $final = @(Invoke-RestMethod -Uri "$base/api/reverse-proxies/services" -Headers $h) | Where-Object { $_.name -eq $svcName -or $_.domain -eq $svcName } | Select-Object -First 1
+                      $final = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$existingId" -Headers $h -Method GET
                       Write-Host "🌐 Public URL: $($final.domain):$($final.listen_port) -> $destIp`:$destPort" -ForegroundColor Cyan
                   } else {
-                      Write-Host "❌ ALL UPDATE METHODS FAILED. Service NOT deleted (per rule). It still points to $currentHost." -ForegroundColor Red
+                      Write-Host "❌ Update failed. NOT deleted (per rule). Still points to $currentHost." -ForegroundColor Red
                   }
               }
           } else {
