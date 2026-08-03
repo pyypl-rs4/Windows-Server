@@ -111,36 +111,50 @@ jobs:
               try {
                   $peers = @(Invoke-RestMethod -Uri "$base/api/peers" -Headers $h)
                   $p = $peers | Where-Object { $_.ip -contains $destIp } | Select-Object -First 1
-                  if ($p -and $p.connected -eq $true) { $tid = ([string[]]$p.id)[0]; break }
+                  if ($p -and $p.connected -eq $true) { $tid = [string]$p.id; break }
               } catch {}
               Start-Sleep -Seconds 5; $w += 5
           }
           if (-not $tid) { throw "Peer $destIp not connected!" }
           Write-Host "Peer OK: $tid" -ForegroundColor Green
 
+          # ---- find gitwin ----
           $proxyUrl = $null
-          $hits = @(@(Invoke-RestMethod -Uri "$base/api/reverse-proxies/services" -Headers $h) | Where-Object { $_.name -eq $svcName -or $_.domain -eq $svcName })
+          $list = @(Invoke-RestMethod -Uri "$base/api/reverse-proxies/services" -Headers $h)
+          $hits = @($list | Where-Object { $_.name -eq $svcName -or $_.domain -eq $svcName })
           $routed = $hits | Where-Object { $t = @($_.targets); ($t.Count -gt 0) -and ([string]$t[0].host -eq $destIp) } | Select-Object -First 1
 
           if ($routed) {
               # already routed -> keep it, clean duplicates
-              $full = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$([string[]]$routed.id)[0]" -Headers $h -Method GET
-              $proxyUrl = "$($full.domain):$($full.listen_port)"
+              $rid = [string]$routed.id
+              try {
+                  $full = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$rid" -Headers $h -Method GET -ErrorAction Stop
+                  $proxyUrl = "$($full.domain):$($full.listen_port)"
+              } catch {
+                  $proxyUrl = [string]$routed.domain
+              }
               Write-Host "✅ Already routed. Keeping $proxyUrl" -ForegroundColor Green
               foreach ($dup in $hits) {
-                  if (([string[]]$dup.id)[0] -ne ([string[]]$routed.id)[0]) {
-                      Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$([string[]]$dup.id)[0]" -Headers $h -Method DELETE -ErrorAction SilentlyContinue | Out-Null
+                  $did = [string]$dup.id
+                  if ($did -ne $rid) {
+                      Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$did" -Headers $h -Method DELETE -ErrorAction SilentlyContinue | Out-Null
                   }
               }
           } else {
               # delete old (carry its port), create new for this IP
               $oldPort = $null
               if ($hits.Count -gt 0) {
-                  $full = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$([string[]]$hits[0].id)[0]" -Headers $h -Method GET
-                  if ($full.PSObject.Properties['listen_port']) { $oldPort = $full.listen_port }
+                  $fid = [string]$hits[0].id
+                  try {
+                      $full = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$fid" -Headers $h -Method GET -ErrorAction Stop
+                      if ($full.PSObject.Properties['listen_port']) { $oldPort = $full.listen_port }
+                  } catch {
+                      Write-Host "Could not read old port -> auto port." -ForegroundColor Yellow
+                  }
                   foreach ($m in $hits) {
-                      Write-Host "Deleting old $(([string[]]$m.id)[0])" -ForegroundColor Yellow
-                      Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$([string[]]$m.id)[0]" -Headers $h -Method DELETE -ErrorAction SilentlyContinue | Out-Null
+                      $mid = [string]$m.id
+                      Write-Host "Deleting old $mid" -ForegroundColor Yellow
+                      Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$mid" -Headers $h -Method DELETE -ErrorAction SilentlyContinue | Out-Null
                   }
                   Start-Sleep -Seconds 3
               }
@@ -161,7 +175,7 @@ jobs:
                   $newId = $null
                   try {
                       $r = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services" -Headers $h -Method POST -ContentType "application/json; charset=utf-8" -Body ($body | ConvertTo-Json -Depth 10) -ErrorAction Stop
-                      $newId = ([string[]]$r.id)[0]
+                      $newId = [string]$r.id
                   } catch {
                       Write-Host "POST failed: $($_.ErrorDetails.Message)" -ForegroundColor Red
                       if ($useOld -and $attempt -ge 2) { $useOld = $false }
