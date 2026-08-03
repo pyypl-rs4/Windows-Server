@@ -88,7 +88,7 @@ jobs:
           echo "NETBIRD_IP=$NetBirdIP" >> $env:GITHUB_ENV
 
       # ============================================
-      # 6.5 MASTER PROXY STEP (check -> create OR route)
+      # 6.5 MASTER PROXY STEP (FINAL)
       # ============================================
       - name: Configure NetBird Reverse Proxy (gitwin)
         env:
@@ -107,7 +107,7 @@ jobs:
           Write-Host "=== MASTER PROXY STEP ==="
           Write-Host "Runner IP: $destIp"
 
-          # ---------- 1. wait for peer online ----------
+          # ---------- 1. wait peer online ----------
           $tid = $null; $waited = 0
           while ($waited -lt 90) {
               try {
@@ -115,118 +115,76 @@ jobs:
                   $myPeer = $peers | Where-Object { $_.ip -contains $destIp } | Select-Object -First 1
                   if ($myPeer -and $myPeer.connected -eq $true) { $tid = ([string[]]$myPeer.id)[0]; break }
               } catch {}
-              Write-Host "waiting for peer... 5s"
-              Start-Sleep -Seconds 5; $waited += 5
+              Write-Host "waiting for peer... 5s"; Start-Sleep -Seconds 5; $waited += 5
           }
           if (-not $tid) { throw "Peer $destIp not connected!" }
           Write-Host "Peer OK: $tid" -ForegroundColor Green
 
-          # ---------- helpers ----------
-          function Get-Svc {
-              try { Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$existingId" -Headers $h -Method GET -ErrorAction Stop } catch { $null }
-          }
-          function Test-Routed {
-              $s = Get-Svc
-              if (-not $s) { return $false }
-              foreach ($t in @($s.targets)) { if ([string]$t.host -eq $destIp) { return $true } }
-              return $false
-          }
-          function New-Target {
-              [ordered]@{ enabled=$true; host=$destIp; port=[int]$destPort; protocol=$mode; target_type="peer"; target_id=$tid; options=[pscustomobject]@{} }
-          }
-
-          # ---------- 2. exists? ----------
+          # ---------- 2. check service ----------
           $allSvcs  = @(Invoke-RestMethod -Uri "$base/api/reverse-proxies/services" -Headers $h)
           $existing = $allSvcs | Where-Object { $_.name -eq $svcName -or $_.domain -eq $svcName } | Select-Object -First 1
 
-          $needCreate = $false
+          $needCreate = $true
           $pinPort = $null
 
-          if (-not $existing) {
-              Write-Host "Service not found -> will CREATE" -ForegroundColor Yellow
-              $needCreate = $true
-          } else {
+          if ($existing) {
               $existingId = ([string[]]$existing.id)[0]
-              $ta = @($existing.targets)
-              $currentHost = $null; $oldTid = $null; $oldListen = $null
-              if ($ta.Count -gt 0) { $currentHost = [string]$ta[0].host; $oldTid = [string]$ta[0].target_id }
-              if ($existing.PSObject.Properties['listen_port']) { $oldListen = $existing.listen_port }
-              Write-Host "Found service $existingId | target=$currentHost | public port=$oldListen" -ForegroundColor Cyan
+              # FULL object by ID (list endpoint hides listen_port!)
+              $full = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$existingId" -Headers $h -Method GET
+              $ta = @($full.targets)
+              $currentHost = $null
+              if ($ta.Count -gt 0) { $currentHost = [string]$ta[0].host }
+              if ($full.PSObject.Properties['listen_port']) { $pinPort = $full.listen_port }
+              Write-Host "Service $existingId | target=$currentHost | public port=$pinPort" -ForegroundColor Cyan
 
-              if (Test-Routed) {
+              if ($currentHost -eq $destIp) {
                   Write-Host "✅ Already routed to $destIp. Nothing to do." -ForegroundColor Green
+                  $needCreate = $false
               } else {
-                  Write-Host "⚠️ Old target. Routing to $destIp..." -ForegroundColor Yellow
-                  $newTarget = New-Target
-                  $updated = $false
-
-                  # S1: PUT full body
-                  $b1 = ($existing | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+                  # try in-place PUT once
+                  $b1 = ($full | ConvertTo-Json -Depth 12) | ConvertFrom-Json
                   foreach ($k in @('id','meta')) { if ($b1.PSObject.Properties[$k]) { $b1.PSObject.Properties.Remove($k) } }
-                  $b1.targets = @( $newTarget )
+                  $b1.targets = @( [ordered]@{ enabled=$true; host=$destIp; port=[int]$destPort; protocol=$mode; target_type="peer"; target_id=$tid; options=[pscustomobject]@{} } )
+                  $routed = $false
                   try {
                       Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$existingId" -Headers $h -Method PUT -ContentType "application/json; charset=utf-8" -Body ($b1 | ConvertTo-Json -Depth 12) -ErrorAction Stop | Out-Null
                       Start-Sleep -Seconds 2
-                      if (Test-Routed) { $updated = $true; Write-Host "✅ Routed via S1 (PUT full)." -ForegroundColor Green }
-                      else { Write-Host "S1 ignored." -ForegroundColor Yellow }
-                  } catch { Write-Host "S1 failed: $($_.ErrorDetails.Message)" -ForegroundColor Red }
+                      $chk = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$existingId" -Headers $h -Method GET
+                      $ch = $null; $ct = @($chk.targets); if ($ct.Count -gt 0) { $ch = [string]$ct[0].host }
+                      if ($ch -eq $destIp) { $routed = $true; $needCreate = $false; Write-Host "✅ Routed in-place (PUT)." -ForegroundColor Green }
+                  } catch { Write-Host "PUT failed: $($_.ErrorDetails.Message)" -ForegroundColor Red }
 
-                  # S2: targets sub-API (POST new + remove old)
-                  if (-not $updated) {
-                      try {
-                          Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$existingId/targets" -Headers $h -Method POST -ContentType "application/json; charset=utf-8" -Body ($newTarget | ConvertTo-Json -Depth 6) -ErrorAction Stop | Out-Null
-                          Write-Host "S2: new target POSTed." -ForegroundColor Cyan
-                          if ($oldTid) {
-                              try { Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$existingId/targets/$oldTid" -Headers $h -Method DELETE -ErrorAction Stop | Out-Null; Write-Host "S2: old target removed." -ForegroundColor Cyan } catch { Write-Host "S2: old target remove skipped." -ForegroundColor Yellow }
-                          }
-                          Start-Sleep -Seconds 2
-                          if (Test-Routed) { $updated = $true; Write-Host "✅ Routed via S2 (targets sub-API)." -ForegroundColor Green }
-                      } catch { Write-Host "S2 failed: $([int]$_.Exception.Response.StatusCode) $($_.ErrorDetails.Message)" -ForegroundColor Red }
-                  }
-
-                  # S3: delete old target first, then PUT full
-                  if (-not $updated -and $oldTid) {
-                      try {
-                          Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$existingId/targets/$oldTid" -Headers $h -Method DELETE -ErrorAction Stop | Out-Null
-                          Write-Host "S3: old target deleted." -ForegroundColor Cyan
-                          Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$existingId" -Headers $h -Method PUT -ContentType "application/json; charset=utf-8" -Body ($b1 | ConvertTo-Json -Depth 12) -ErrorAction Stop | Out-Null
-                          Start-Sleep -Seconds 2
-                          if (Test-Routed) { $updated = $true; Write-Host "✅ Routed via S3 (delete target + PUT)." -ForegroundColor Green }
-                      } catch { Write-Host "S3 failed: $([int]$_.Exception.Response.StatusCode) $($_.ErrorDetails.Message)" -ForegroundColor Red }
-                  }
-
-                  # S4: LAST RESORT - recreate, keep same public port
-                  if (-not $updated) {
-                      Write-Host "⚠️ S1-S3 failed. LAST RESORT: recreate, keep public port $oldListen" -ForegroundColor Yellow
-                      try { Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$existingId" -Headers $h -Method DELETE -ErrorAction SilentlyContinue | Out-Null } catch {}
+                  if (-not $routed) {
+                      Write-Host "⚠️ API refuses in-place re-route. Recreate with SAME public port $pinPort ..." -ForegroundColor Yellow
+                      Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$existingId" -Headers $h -Method DELETE -ErrorAction SilentlyContinue | Out-Null
+                      Start-Sleep -Seconds 3
                       $needCreate = $true
-                      $pinPort = $oldListen
                   }
               }
+          } else {
+              Write-Host "Service not found -> CREATE" -ForegroundColor Yellow
           }
 
-          # ---------- 3. create (retry until healthy) ----------
+          # ---------- 3. create (retry until healthy, pin port) ----------
           if ($needCreate) {
               $attempt = 1
               while ($true) {
                   Write-Host "CREATE attempt $attempt ..."
-                  $tgt = New-Target
                   $body = [ordered]@{
                       name=$svcName; domain=$svcName; mode=$mode; enabled=$true; private=$false
                       pass_host_header=$false; rewrite_redirects=$false; terminated=$false
                       proxy_cluster="eu1.netbird.services"; auth=[pscustomobject]@{}
-                      port_auto_assigned=$true; targets=@($tgt)
+                      port_auto_assigned=$true; targets=@( [ordered]@{ enabled=$true; host=$destIp; port=[int]$destPort; protocol=$mode; target_type="peer"; target_id=$tid; options=[pscustomobject]@{} } )
                   }
                   if ($pinPort) { $body.port_auto_assigned = $false; $body.listen_port = [int]$pinPort }
-                  $json = $body | ConvertTo-Json -Depth 10
 
                   $newId = $null
                   try {
-                      $r = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services" -Headers $h -Method POST -ContentType "application/json; charset=utf-8" -Body $json -ErrorAction Stop
+                      $r = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services" -Headers $h -Method POST -ContentType "application/json; charset=utf-8" -Body ($body | ConvertTo-Json -Depth 10) -ErrorAction Stop
                       $newId = ([string[]]$r.id)[0]
                   } catch {
                       Write-Host "POST failed: $($_.ErrorDetails.Message)" -ForegroundColor Red
-                      if ($pinPort) { Write-Host "Pinned port busy -> auto port." -ForegroundColor Yellow; $pinPort = $null }
+                      if ($pinPort) { Write-Host "Port $pinPort busy -> auto port." -ForegroundColor Yellow; $pinPort = $null }
                       Start-Sleep -Seconds 5; $attempt++; continue
                   }
 
@@ -238,7 +196,7 @@ jobs:
                   } catch {}
 
                   if ($status -eq "error") {
-                      Write-Host "Status ERROR. Removing bad attempt, retrying..." -ForegroundColor Red
+                      Write-Host "Status ERROR. Retry..." -ForegroundColor Red
                       try { Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$newId" -Headers $h -Method DELETE -ErrorAction SilentlyContinue | Out-Null } catch {}
                       Start-Sleep -Seconds 5; $attempt++
                   } else {
