@@ -87,7 +87,7 @@ jobs:
           echo "NETBIRD_IP=$NetBirdIP" >> $env:GITHUB_ENV
 
       # ============================================
-      # 6.5 PROXY STEP (BULLETPROOF ID + CAPPED)
+      # 6.5 PROXY STEP (DEEP-UNROLL FIX)
       # ============================================
       - name: Configure NetBird Reverse Proxy (gitwin)
         env:
@@ -105,33 +105,40 @@ jobs:
 
           Write-Host "Runner IP: $destIp"
 
-          # ---- peer id: plain indexed loop, NO pipelines (kills the space-joined bug) ----
-          $tid = $null
-          $w = 0
+          # ---- THE FIX: deep-unroll nested arrays from Invoke-RestMethod ----
+          function Unroll($o) {
+              if ($null -eq $o) { return @() }
+              if ($o -is [string]) { return @($o) }
+              if ($o -is [System.Collections.IEnumerable]) {
+                  $out = @()
+                  foreach ($x in $o) { $out += Unroll $x }
+                  return $out
+              }
+              return @($o)
+          }
+
+          # ---- peer id (unrolled, indexed, guarded) ----
+          $tid = $null; $w = 0
           while ($w -lt 90 -and -not $tid) {
               try {
-                  $peers = @(Invoke-RestMethod -Uri "$base/api/peers" -Headers $h)
+                  $peers = Unroll (Invoke-RestMethod -Uri "$base/api/peers" -Headers $h)
                   for ($i = 0; $i -lt $peers.Count; $i++) {
                       $one = $peers[$i]
                       $ips = @($one.ip)
                       for ($j = 0; $j -lt $ips.Count; $j++) {
-                          if ([string]$ips[$j] -eq $destIp -and $one.connected -eq $true) {
-                              $tid = [string]$one.id
-                              break
-                          }
+                          if ([string]$ips[$j] -eq $destIp -and $one.connected -eq $true) { $tid = [string]$one.id; break }
                       }
                       if ($tid) { break }
                   }
               } catch {}
               if (-not $tid) { Start-Sleep -Seconds 5; $w += 5 }
           }
-          # GUARD: never allow empty or space-joined id
           if (-not $tid -or $tid.Contains(" ")) { throw "Bad peer id for $destIp : '$tid'" }
           Write-Host "Peer OK: $tid" -ForegroundColor Green
 
-          # ---- find gitwin ----
+          # ---- find gitwin (unrolled) ----
           $proxyUrl = $null
-          $list = @(Invoke-RestMethod -Uri "$base/api/reverse-proxies/services" -Headers $h)
+          $list = Unroll (Invoke-RestMethod -Uri "$base/api/reverse-proxies/services" -Headers $h)
           $hits = @()
           for ($i = 0; $i -lt $list.Count; $i++) {
               if ([string]$list[$i].name -eq $svcName -or [string]$list[$i].domain -eq $svcName) { $hits += $list[$i] }
