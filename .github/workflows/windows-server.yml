@@ -87,7 +87,7 @@ jobs:
           echo "NETBIRD_IP=$NetBirdIP" >> $env:GITHUB_ENV
 
       # ============================================
-      # 6.5 PROXY STEP (DELETE + CREATE, KEEP PORT)
+      # 6.5 PROXY STEP (DELETE + CREATE, AUTO PORT)
       # ============================================
       - name: Configure NetBird Reverse Proxy (gitwin)
         env:
@@ -141,36 +141,24 @@ jobs:
                   }
               }
           } else {
-              # delete old (carry its port), create new for this IP
-              $oldPort = $null
-              if ($hits.Count -gt 0) {
-                  $fid = [string]$hits[0].id
-                  try {
-                      $full = Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$fid" -Headers $h -Method GET -ErrorAction Stop
-                      if ($full.PSObject.Properties['listen_port']) { $oldPort = $full.listen_port }
-                  } catch {
-                      Write-Host "Could not read old port -> auto port." -ForegroundColor Yellow
-                  }
-                  foreach ($m in $hits) {
-                      $mid = [string]$m.id
-                      Write-Host "Deleting old $mid" -ForegroundColor Yellow
-                      Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$mid" -Headers $h -Method DELETE -ErrorAction SilentlyContinue | Out-Null
-                  }
-                  Start-Sleep -Seconds 3
+              # delete old, create new for this IP (auto port = always bindable)
+              foreach ($m in $hits) {
+                  $mid = [string]$m.id
+                  Write-Host "Deleting old $mid" -ForegroundColor Yellow
+                  Invoke-RestMethod -Uri "$base/api/reverse-proxies/services/$mid" -Headers $h -Method DELETE -ErrorAction SilentlyContinue | Out-Null
               }
+              Start-Sleep -Seconds 3
 
-              $attempt = 1; $useOld = ($null -ne $oldPort)
+              $attempt = 1
               while ($true) {
-                  $pl = if ($useOld) { [string]$oldPort } else { "auto" }
-                  Write-Host "CREATE attempt $attempt (port $pl)..."
+                  Write-Host "CREATE attempt $attempt (auto port)..."
                   $body = [ordered]@{
                       name=$svcName; domain=$svcName; mode=$mode; enabled=$true; private=$false
                       pass_host_header=$false; rewrite_redirects=$false; terminated=$false
                       proxy_cluster="eu1.netbird.services"; auth=[pscustomobject]@{}
-                      port_auto_assigned=(-not $useOld)
+                      port_auto_assigned=$true
                       targets=@( [ordered]@{ enabled=$true; host=$destIp; port=[int]$destPort; protocol=$mode; target_type="peer"; target_id=$tid; options=[pscustomobject]@{} } )
                   }
-                  if ($useOld) { $body.listen_port = [int]$oldPort }
 
                   $newId = $null
                   try {
@@ -178,7 +166,6 @@ jobs:
                       $newId = [string]$r.id
                   } catch {
                       Write-Host "POST failed: $($_.ErrorDetails.Message)" -ForegroundColor Red
-                      if ($useOld -and $attempt -ge 2) { $useOld = $false }
                       Start-Sleep -Seconds 5; $attempt++; continue
                   }
 
